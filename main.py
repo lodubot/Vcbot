@@ -62,7 +62,15 @@ def clean_text(text: str) -> str:
 
 # Play next track in queue with file cleanup to prevent memory/bot kill
 async def play_next(client_call, chat_id):
+    global userbot
     if chat_id in queues and len(queues[chat_id]) > 0:
+        # Peer cache ensure karne ke liye pehle get_chat call karein
+        if userbot:
+            try:
+                await userbot.get_chat(chat_id)
+            except Exception:
+                pass
+
         # Purane gaane ko queue se hatane se pehle uska file path nikal kar delete karein
         finished_track = queues[chat_id][0]
         old_path = finished_track.get("local_path")
@@ -141,18 +149,12 @@ userbot_lock = asyncio.Lock()
 _swap_counter = 0
 
 async def start_userbot(session_str: str):
-    """Starts (or hot-swaps) the userbot + PyTgCalls using the given session string.
-    Returns (True, None) on success or (False, error_message) on failure.
-    Serialized with a lock so overlapping /login calls can't race each other and
-    corrupt/close each other's SQLite storage mid-flight."""
     global userbot, call_py, _swap_counter
 
     async with userbot_lock:
         old_userbot = userbot
         old_call_py = call_py
 
-        # Detach globals immediately so no other handler touches the old client
-        # while we shut it down in the background.
         userbot = None
         call_py = None
 
@@ -166,9 +168,6 @@ async def start_userbot(session_str: str):
                 await asyncio.wait_for(old_userbot.stop(), timeout=10)
             except Exception:
                 pass
-            # Pyrogram fires off a fetch_peers/handle_updates background task on start()
-            # that can still be finishing when stop() returns. Give it a beat so it
-            # settles before we free the storage object entirely.
             await asyncio.sleep(1)
 
         try:
@@ -201,10 +200,6 @@ async def start_userbot(session_str: str):
             return False, str(e)
 
 def _loop_exception_handler(loop, context):
-    """Old clients occasionally leave a stray fetch_peers/handle_updates task running
-    a moment after stop(); it then hits a closed SQLite connection. That's harmless
-    (the client is already discarded), so log it quietly instead of letting asyncio
-    print a scary unhandled-exception trace to the Render logs."""
     exc = context.get("exception")
     msg = str(exc) if exc else context.get("message", "")
     if "closed database" in msg.lower():
@@ -213,7 +208,7 @@ def _loop_exception_handler(loop, context):
     loop.default_exception_handler(context)
 
 # -------------------------------------------------------------
-# 🌐 Tiny web server so Render (or any host) can ping/health-check us
+# 🌐 Tiny web server
 # -------------------------------------------------------------
 async def run_web_server():
     from aiohttp import web
@@ -231,7 +226,7 @@ async def run_web_server():
     port = int(os.environ.get("PORT", 3000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Web server listening on port {port} (ping this to keep Render awake)")
+    print(f"🌐 Web server listening on port {port}")
 
 # -------------------------------------------------------------
 # 🚀 MAIN ENGINE RUNNER
@@ -251,7 +246,6 @@ async def main():
     register_handlers(bot)
     await bot.start()
 
-    # Start the tiny HTTP server so Render's free Web Service stays healthy/pingable
     await run_web_server()
 
     saved = load_sessions()
@@ -332,9 +326,9 @@ def register_handlers(app: Client):
             await msg.edit_text("✅ Login Successful! Userbot ko activate kar raha hoon...")
             ok, err = await start_userbot(session_str)
             if ok:
-                await msg.edit_text("✅ Login Successful! Userbot ab LIVE hai — /play try karein, restart ki zaroorat nahi.")
+                await msg.edit_text("✅ Login Successful! Userbot ab LIVE hai — /play try karein.")
             else:
-                await msg.edit_text(f"⚠️ Login save ho gaya, par Userbot start karte waqt error aaya: {err}\nEk baar service restart karke dekhein.")
+                await msg.edit_text(f"⚠️ Login save ho gaya, par Userbot start karte waqt error aaya: {err}")
 
         except SessionPasswordNeeded:
             await msg.edit_text("🔐 2FA Password Detected!\n\nReply karein: /pass your_password", parse_mode=None)
@@ -371,7 +365,7 @@ def register_handlers(app: Client):
             if ok:
                 await msg.edit_text("✅ Login Successful with 2FA! Userbot ab LIVE hai — /play try karein.")
             else:
-                await msg.edit_text(f"⚠️ Login save ho gaya, par Userbot start karte waqt error aaya: {err}\nEk baar service restart karke dekhein.")
+                await msg.edit_text(f"⚠️ Login save ho gaya, par Userbot start karte waqt error aaya: {err}")
         except PasswordHashInvalid:
             await msg.edit_text("❌ Galat password! /pass your_password firse try karein.", parse_mode=None)
         except Exception as e:
@@ -397,7 +391,7 @@ def register_handlers(app: Client):
             "🎵 Music Commands:\n"
             "🔹 /play <name/url> - Play Audio in VC (Queued)\n"
             "🔹 /vplay <name/url> - Play Video in VC (Queued)\n"
-            "🔹 /skip - Skip current song (Admin/Owner instant / Users via Vote Button)\n"
+            "🔹 /skip - Skip current song\n"
             "🔹 /pause | /resume | /stop\n\n"
             f"🇮🇳 Developed by {config.DEVELOPED_BY}"
         )
@@ -414,6 +408,12 @@ def register_handlers(app: Client):
 
         chat_id = message.chat.id
         msg = await message.reply_text("⚡ Fetching & Processing Track...")
+
+        # Peer cache ensure karne ke liye userbot se pehle chat fetch karein
+        try:
+            await userbot.get_chat(chat_id)
+        except Exception:
+            pass
 
         try:
             await userbot.get_chat_member(chat_id, "me")
@@ -573,7 +573,6 @@ def register_handlers(app: Client):
         if call_py:
             try:
                 chat_id = message.chat.id
-                # Stop par bhi queue ki saari files clean kar dein taaki RAM free rahe
                 if chat_id in queues:
                     for track in queues[chat_id]:
                         p = track.get("local_path")
