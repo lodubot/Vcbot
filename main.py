@@ -137,50 +137,80 @@ async def is_admin(client, chat_id, user_id):
 # -------------------------------------------------------------
 # 👤 Userbot Hot-Loader (used at boot AND right after /otp or /pass login)
 # -------------------------------------------------------------
+userbot_lock = asyncio.Lock()
+_swap_counter = 0
+
 async def start_userbot(session_str: str):
     """Starts (or hot-swaps) the userbot + PyTgCalls using the given session string.
-    Returns (True, None) on success or (False, error_message) on failure."""
-    global userbot, call_py
+    Returns (True, None) on success or (False, error_message) on failure.
+    Serialized with a lock so overlapping /login calls can't race each other and
+    corrupt/close each other's SQLite storage mid-flight."""
+    global userbot, call_py, _swap_counter
 
-    # If a userbot is already running, stop it first so we can swap sessions
-    if call_py is not None:
+    async with userbot_lock:
+        old_userbot = userbot
+        old_call_py = call_py
+
+        # Detach globals immediately so no other handler touches the old client
+        # while we shut it down in the background.
+        userbot = None
+        call_py = None
+
+        if old_call_py is not None:
+            try:
+                await asyncio.wait_for(old_call_py.stop(), timeout=10)
+            except Exception:
+                pass
+        if old_userbot is not None:
+            try:
+                await asyncio.wait_for(old_userbot.stop(), timeout=10)
+            except Exception:
+                pass
+            # Pyrogram fires off a fetch_peers/handle_updates background task on start()
+            # that can still be finishing when stop() returns. Give it a beat so it
+            # settles before we free the storage object entirely.
+            await asyncio.sleep(1)
+
         try:
-            await call_py.stop()
-        except Exception:
-            pass
-    if userbot is not None:
-        try:
-            await userbot.stop()
-        except Exception:
-            pass
+            _swap_counter += 1
+            new_userbot = Client(
+                f"DevNullUserbot_{_swap_counter}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                session_string=session_str,
+                in_memory=True,
+            )
+            await new_userbot.start()
 
-    try:
-        new_userbot = Client(
-            "DevNullUserbot",
-            api_id=config.API_ID,
-            api_hash=config.API_HASH,
-            session_string=session_str,
-            in_memory=True,
-        )
-        await new_userbot.start()
+            new_call_py = PyTgCalls(new_userbot)
 
-        new_call_py = PyTgCalls(new_userbot)
+            @new_call_py.on_update()
+            async def stream_end_handler(client, update):
+                if isinstance(update, StreamEnded):
+                    chat_id = update.chat_id
+                    await play_next(client, chat_id)
 
-        @new_call_py.on_update()
-        async def stream_end_handler(client, update):
-            if isinstance(update, StreamEnded):
-                chat_id = update.chat_id
-                await play_next(client, chat_id)
+            await new_call_py.start()
 
-        await new_call_py.start()
+            userbot = new_userbot
+            call_py = new_call_py
+            print("✅ Active Userbot & PyTgCalls Loaded Successfully!")
+            return True, None
+        except Exception as e:
+            print(f"⚠️ Userbot start error: {e}")
+            return False, str(e)
 
-        userbot = new_userbot
-        call_py = new_call_py
-        print("✅ Active Userbot & PyTgCalls Loaded Successfully!")
-        return True, None
-    except Exception as e:
-        print(f"⚠️ Userbot start error: {e}")
-        return False, str(e)
+def _loop_exception_handler(loop, context):
+    """Old clients occasionally leave a stray fetch_peers/handle_updates task running
+    a moment after stop(); it then hits a closed SQLite connection. That's harmless
+    (the client is already discarded), so log it quietly instead of letting asyncio
+    print a scary unhandled-exception trace to the Render logs."""
+    exc = context.get("exception")
+    msg = str(exc) if exc else context.get("message", "")
+    if "closed database" in msg.lower():
+        print(f"ℹ️ Ignored harmless stale-session cleanup error: {msg}")
+        return
+    loop.default_exception_handler(context)
 
 # -------------------------------------------------------------
 # 🌐 Tiny web server so Render (or any host) can ping/health-check us
@@ -208,6 +238,8 @@ async def run_web_server():
 # -------------------------------------------------------------
 async def main():
     global bot
+
+    asyncio.get_event_loop().set_exception_handler(_loop_exception_handler)
 
     bot = Client(
         "DevNullBot", 
