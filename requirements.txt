@@ -1,0 +1,7 @@
+pyrogram==2.0.106
+git+https://github.com/pytgcalls/pytgcalls.git
+tgcrypto
+yt-search
+yt-dlp
+aiohttp
+requests
